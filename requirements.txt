@@ -1,0 +1,16 @@
+# conda activate dmodel 环境已包含：
+# torch==2.8.0+cu129, nvdiffrast==0.4.0, numpy, pillow
+
+# 核心依赖（pip install -r requirements.txt）：
+trimesh>=4.0.0
+rtree>=1.0.0
+pytorch-msssim>=1.0.0
+scipy>=1.10.0
+opencv-python>=4.8.0
+
+# FLUX-Schnell 恢复网络依赖（--use_flux 时需要）：
+# pip install diffusers transformers sentencepiece accelerate
+diffusers>=0.30.0
+transformers>=4.40.0
+sentencepiece>=0.1.99
+accelerate>=0.30.0
