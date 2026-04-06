@@ -330,21 +330,38 @@ def run_iterative_refinement(
             if alpha.sum() < 100:
                 continue
 
+            # 背景置黑，避免灰色背景污染 restorer 输入
+            I_low = I_low * alpha
+
             # 经恢复网络生成伪真值
             I_target = restorer(I_low)
 
-            # 保存伪真值到临时目录，供 optimize_texture 加载
+            # 保存前后对比图到临时目录
             tmp_dir = os.path.join(output_dir, "tmp_novel_views")
             os.makedirs(tmp_dir, exist_ok=True)
             tmp_path = os.path.join(tmp_dir, f"iter{it}_{cam['name']}.png")
 
-            # 保存为图像文件
-            img_np = I_target.detach().cpu().squeeze(0).numpy()
-            img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
-            cv2.imwrite(tmp_path, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+            def _to_uint8(t: torch.Tensor) -> np.ndarray:
+                """(1,H,W,3) float Tensor → (H,W,3) uint8 BGR ndarray"""
+                arr = t.detach().cpu().squeeze(0).numpy()
+                arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
+                return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+            before_bgr = _to_uint8(I_low)
+            after_bgr  = _to_uint8(I_target)
+
+            # 左：refine 前，右：refine 后，中间 4px 白色分隔线
+            divider = np.full((before_bgr.shape[0], 4, 3), 255, dtype=np.uint8)
+            compare = np.concatenate([before_bgr, divider, after_bgr], axis=1)
+            cv2.imwrite(tmp_path, compare)
+
+            # 同时保存独立的 before/after 图像（供 optimize_texture 加载的是 after）
+            cv2.imwrite(tmp_path.replace(".png", "_before.png"), before_bgr)
+            cv2.imwrite(tmp_path.replace(".png", "_after.png"),  after_bgr)
 
             cam_with_img = dict(cam)
-            cam_with_img["image_path"] = tmp_path
+            # optimize_texture 加载 after 图（单图，非对比拼接图）
+            cam_with_img["image_path"] = tmp_path.replace(".png", "_after.png")
             refined_cameras.append(cam_with_img)
 
         if len(refined_cameras) == 0:
@@ -401,7 +418,7 @@ def parse_args():
                    help="使用 FLUX-Schnell 图像恢复网络增强新视角（需要 diffusers）")
     p.add_argument("--flux_model",       default="black-forest-labs/FLUX.1-schnell",
                    help="FLUX 模型 ID 或本地路径")
-    p.add_argument("--flux_weights_dir", default=None,
+    p.add_argument("--flux_weights_dir", default="/dexmal-fa-ltl/weights",
                    help="HuggingFace 权重缓存目录（默认使用 HuggingFace 标准缓存）")
     p.add_argument("--flux_strength",    type=float, default=0.3,
                    help="img2img 强度 (0~1)，越低越保留输入结构")
