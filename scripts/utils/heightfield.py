@@ -159,9 +159,18 @@ def build_heightfield_mesh(
     mesh_ply_path: str,
     mesh_info_path: str,
     resolution: int = 512,
+    aligned_vertices: np.ndarray = None,
 ) -> dict:
     """
-    完整流程：加载 NeuS Mesh → 射线采样 → 生成 2.5D 高度场 Mesh。
+    完整流程：加载 NeuS Mesh → （可选）替换为对齐顶点 → 射线采样 → 生成 2.5D 高度场 Mesh。
+
+    Parameters
+    ----------
+    mesh_ply_path     : 输入 PLY 路径
+    mesh_info_path    : mesh_info.txt 路径
+    resolution        : 高度场网格分辨率
+    aligned_vertices  : (V, 3) float32，若提供则替换 PLY 中的顶点（对齐后），
+                        拓扑（faces）保持不变；None 表示直接使用原始顶点。
 
     Returns
     -------
@@ -183,18 +192,43 @@ def build_heightfield_mesh(
     mesh = trimesh.load(mesh_ply_path, force="mesh", process=False)
     print(f"[heightfield] 顶点: {len(mesh.vertices)}, 面: {len(mesh.faces)}")
 
-    info = load_mesh_info(mesh_info_path)
-    range_ = info["range"]
-    val_range = info["val_range"]
+    # 若提供了对齐后的顶点，替换原始顶点（拓扑不变）
+    if aligned_vertices is not None:
+        if len(aligned_vertices) != len(mesh.vertices):
+            raise ValueError(
+                f"aligned_vertices 顶点数 ({len(aligned_vertices)}) "
+                f"与 PLY ({len(mesh.vertices)}) 不一致"
+            )
+        mesh = trimesh.Trimesh(
+            vertices=aligned_vertices.astype(np.float32),
+            faces=mesh.faces,
+            process=False,
+        )
+        print("[heightfield] 使用已对齐顶点")
 
-    # val_range 是 Marching Cube 归一化坐标，mesh 已恢复真实尺度
-    # 场景范围（本地坐标，单位：米）
-    x_min = float(val_range[0, 0] * range_)
-    x_max = float(val_range[1, 0] * range_)
-    y_min = float(val_range[0, 1] * range_)
-    y_max = float(val_range[1, 1] * range_)
-    z_min = float(val_range[0, 2] * range_)
-    z_max = float(val_range[1, 2] * range_)
+    info = load_mesh_info(mesh_info_path)
+
+    if aligned_vertices is not None:
+        # 对齐后用实际顶点范围重算 bounds，防止平移后超出 val_range 边界
+        verts = np.asarray(mesh.vertices, dtype=np.float32)
+        x_min = float(verts[:, 0].min())
+        x_max = float(verts[:, 0].max())
+        y_min = float(verts[:, 1].min())
+        y_max = float(verts[:, 1].max())
+        z_min = float(verts[:, 2].min())
+        z_max = float(verts[:, 2].max())
+        print("[heightfield] Bounds 由实际对齐顶点范围确定")
+    else:
+        range_ = info["range"]
+        val_range = info["val_range"]
+        # val_range 是 Marching Cube 归一化坐标，mesh 已恢复真实尺度
+        # 场景范围（本地坐标，单位：米）
+        x_min = float(val_range[0, 0] * range_)
+        x_max = float(val_range[1, 0] * range_)
+        y_min = float(val_range[0, 1] * range_)
+        y_max = float(val_range[1, 1] * range_)
+        z_min = float(val_range[0, 2] * range_)
+        z_max = float(val_range[1, 2] * range_)
 
     print(f"[heightfield] 场景范围 X:[{x_min:.1f}, {x_max:.1f}] "
           f"Y:[{y_min:.1f}, {y_max:.1f}] Z:[{z_min:.1f}, {z_max:.1f}] 米")

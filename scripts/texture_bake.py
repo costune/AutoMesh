@@ -377,7 +377,7 @@ def parse_args():
     p.add_argument("--output",      required=True, help="输出目录")
     p.add_argument("--hf_res",      type=int, default=512,  help="高度场分辨率")
     p.add_argument("--atlas_size",  type=int, default=8192, help="纹理 atlas 最终分辨率")
-    p.add_argument("--init_atlas_size", type=int, default=None,
+    p.add_argument("--init_atlas_size", type=int, default=512,
                    help="渐进分辨率起始尺寸（2 的幂，如 512）；None 表示直接用 atlas_size")
     p.add_argument("--basic_epochs",type=int, default=100,  help="T_basic 优化轮数")
     p.add_argument("--refine_iters",type=int, default=2,    help="精炼迭代次数")
@@ -387,6 +387,15 @@ def parse_args():
     p.add_argument("--device",      default="cuda", help="计算设备")
     p.add_argument("--skip_refine", action="store_true", help="跳过迭代精炼阶段")
     p.add_argument("--save_hf_mesh",action="store_true", help="保存高度场 PLY Mesh")
+    # Mesh 对齐到稀疏点云
+    p.add_argument("--points3d", default=None,
+                   help="COLMAP points3D.txt 路径；提供后在高度场转换前自动对齐 Mesh 到点云")
+    p.add_argument("--align_fft_voxel_size", type=float, default=2.0,
+                   help="FFT 粗对齐体素尺寸（米），默认 2.0")
+    p.add_argument("--align_trim",  type=float, default=0.3,
+                   help="trimmed-median 每轮丢弃的最差对比例，默认 0.3")
+    p.add_argument("--align_iters", type=int,   default=20,
+                   help="精对齐最大迭代次数，默认 20")
     # FLUX-Schnell 恢复网络参数
     p.add_argument("--use_flux",         action="store_true",
                    help="使用 FLUX-Schnell 图像恢复网络增强新视角（需要 diffusers）")
@@ -414,6 +423,51 @@ def main():
     print("=" * 60)
 
     # ------------------------------------------------------------------
+    # 步骤 0a（可选）：Mesh 对齐到 COLMAP 稀疏点云
+    # ------------------------------------------------------------------
+    aligned_verts = None
+    if args.points3d:
+        from utils.alignment import load_colmap_points3d, align_mesh_to_pointcloud
+        import trimesh as _trimesh
+
+        points3d_path = os.path.abspath(args.points3d)
+        if not os.path.isfile(points3d_path):
+            raise FileNotFoundError(f"找不到 points3D.txt: {points3d_path}")
+
+        print("\n[步骤 0a] 加载 COLMAP 稀疏点云 ...")
+        colmap_pts = load_colmap_points3d(points3d_path,
+                                          max_reproj_error=2.0,
+                                          min_track_len=3)
+        print(f"  有效点: {len(colmap_pts)}")
+
+        print("\n[步骤 0b] Mesh 对齐到点云 ...")
+        raw_mesh_path = os.path.abspath(args.mesh)
+        raw_mesh = _trimesh.load(raw_mesh_path, force="mesh", process=False)
+        aligned_verts = align_mesh_to_pointcloud(
+            np.asarray(raw_mesh.vertices, dtype=np.float32),
+            colmap_pts,
+            trim_fraction=args.align_trim,
+            n_iters=args.align_iters,
+            fft_voxel_size=args.align_fft_voxel_size,
+        )
+
+        # 保存对齐结果供可视化检验
+        aligned_mesh_path = os.path.join(args.output, "aligned_mesh.ply")
+        colmap_ply_path   = os.path.join(args.output, "colmap_points.ply")
+
+        aligned_mesh_obj = _trimesh.Trimesh(
+            vertices=aligned_verts.astype(np.float64),
+            faces=raw_mesh.faces,
+            process=False,
+        )
+        aligned_mesh_obj.export(aligned_mesh_path)
+        print(f"  [对齐] 已保存对齐后 Mesh: {aligned_mesh_path}")
+
+        colmap_pcd = _trimesh.PointCloud(vertices=colmap_pts.astype(np.float64))
+        colmap_pcd.export(colmap_ply_path)
+        print(f"  [对齐] 已保存 COLMAP 点云: {colmap_ply_path}")
+
+    # ------------------------------------------------------------------
     # 步骤 0：NeuS Mesh → 2.5D 高度场 Mesh
     # ------------------------------------------------------------------
     print("\n[步骤 0] 生成 2.5D 高度场 Mesh ...")
@@ -421,6 +475,7 @@ def main():
         mesh_ply_path=args.mesh,
         mesh_info_path=args.mesh_info,
         resolution=args.hf_res,
+        aligned_vertices=aligned_verts,
     )
 
     if args.save_hf_mesh:

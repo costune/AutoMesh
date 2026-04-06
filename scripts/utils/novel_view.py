@@ -6,7 +6,7 @@
   - 相机高度：450m（相对 Mesh 最高点）
   - 俯仰角：45°（向下看）
   - 朝向：东/西/南/北四个基本方向
-  - 渲染分辨率：2048×2048
+  - 渲染分辨率：1024×1024（与 FLUX-Schnell 最优输入尺寸一致）
 
 坐标系与 cameras/*.json 一致（本地坐标，单位：米）。
 """
@@ -89,8 +89,8 @@ def generate_novel_cameras(
     pitch_deg: float = 45.0,
     grid_spacing: float = 150.0,
     aabb_margin: float = 100.0,
-    img_w: int = 2048,
-    img_h: int = 2048,
+    img_w: int = 1024,
+    img_h: int = 1024,
     fov_deg: float = 60.0,
 ) -> List[dict]:
     """
