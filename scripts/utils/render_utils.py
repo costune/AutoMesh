@@ -226,6 +226,34 @@ def load_image_as_tensor(
     return torch.tensor(img, device=device).unsqueeze(0)  # (1, H, W, 3)
 
 
+def load_mask_as_tensor(
+    mask_path: str,
+    target_h: int,
+    target_w: int,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    加载图像 mask，返回 (1, H, W, 1) float32 Tensor，值域 [0, 1]。
+
+    支持格式：
+      - .npy : 值 0/1 (uint8)
+      - .png / .jpg : 灰度图，255 = 有效，0 = 无效
+    """
+    import cv2
+    if mask_path.endswith(".npy"):
+        m = np.load(mask_path).astype(np.float32)          # (H, W), 0/1
+    else:
+        m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            raise FileNotFoundError(f"无法读取 mask: {mask_path}")
+        m = m.astype(np.float32) / 255.0                    # (H, W), 0/1
+
+    if m.shape[0] != target_h or m.shape[1] != target_w:
+        m = cv2.resize(m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+    return torch.tensor(m, device=device).unsqueeze(0).unsqueeze(-1)  # (1, H, W, 1)
+
+
 def save_texture(texture: torch.Tensor, path: str):
     """将纹理 atlas 保存为 PNG。"""
     import cv2

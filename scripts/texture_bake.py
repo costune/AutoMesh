@@ -64,6 +64,7 @@ from utils.render_utils import (
     create_texture,
     upsample_texture,
     load_image_as_tensor,
+    load_mask_as_tensor,
     save_texture,
 )
 from utils.novel_view import generate_novel_cameras, subsample_novel_cameras
@@ -251,8 +252,22 @@ def optimize_texture(
             if alpha.sum() < 10:
                 continue
 
+            # 合并渲染 alpha 与图像 mask：两者均为 1 的像素才参与 loss
+            mask_path = cam.get("mask_path")
+            if mask_path is not None and os.path.exists(mask_path):
+                try:
+                    img_mask = load_mask_as_tensor(mask_path, img_h, img_w, device)
+                    effective_mask = alpha * img_mask
+                except Exception:
+                    effective_mask = alpha
+            else:
+                effective_mask = alpha
+
+            if effective_mask.sum() < 10:
+                continue
+
             # 计算损失
-            loss = texture_loss(color, gt, alpha, lambda_mse, lambda_ssim)
+            loss = texture_loss(color, gt, effective_mask, lambda_mse, lambda_ssim)
 
             optimizer.zero_grad()
             loss.backward()
@@ -392,6 +407,7 @@ def parse_args():
     p.add_argument("--mesh_info",   required=True, help="mesh_info.txt 路径")
     p.add_argument("--cameras",     required=True, help="cameras/ 目录路径")
     p.add_argument("--images",      required=True, help="输入卫星图像目录")
+    p.add_argument("--masks",       default=None,  help="图像 mask 目录（.npy 或 .png，与图像同名）；不指定则不使用 mask")
     p.add_argument("--output",      required=True, help="输出目录")
     p.add_argument("--hf_res",      type=int, default=512,  help="高度场分辨率")
     p.add_argument("--atlas_size",  type=int, default=8192, help="纹理 atlas 最终分辨率")
@@ -528,6 +544,25 @@ def main():
             img = cv2.imread(cam["image_path"])
             if img is not None:
                 cam["img_h"], cam["img_w"] = img.shape[:2]
+
+    # 为每个相机匹配对应的图像 mask（优先 .npy，其次 .png）
+    if args.masks:
+        matched = 0
+        for cam in cameras:
+            name = cam["name"]
+            mask_path = None
+            for ext in [".npy", ".png"]:
+                candidate = os.path.join(args.masks, name + ext)
+                if os.path.exists(candidate):
+                    mask_path = candidate
+                    break
+            cam["mask_path"] = mask_path
+            if mask_path is not None:
+                matched += 1
+        print(f"  匹配到 {matched}/{len(cameras)} 个图像 mask")
+    else:
+        for cam in cameras:
+            cam["mask_path"] = None
 
     # ------------------------------------------------------------------
     # 步骤 1.5（可选）：渲染所有 COLMAP 视角的法向量图
