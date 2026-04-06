@@ -136,6 +136,11 @@ def render_texture(
     # 6. 抗锯齿（反向传播时平滑边界梯度）
     color = dr.antialias(color, rast, clip, faces)
 
+    # 7. 垂直翻转：nvdiffrast 输出 row 0 = NDC y=-1 = 图像底部（OpenGL Y-up 规范），
+    #    翻转后 row 0 = 图像顶部，与标准图像坐标系一致（参见 nvdiffrast/samples/triangle.py）
+    color = color.flip(dims=[1])
+    alpha = alpha.flip(dims=[1])
+
     return color, alpha
 
 
@@ -270,6 +275,10 @@ def render_normals(
 
     # 背景像素置零
     n_interp = n_interp * alpha
+
+    # 垂直翻转：与 render_texture 保持一致（nvdiffrast Y-up 规范修正）
+    n_interp = n_interp.flip(dims=[1])
+    alpha    = alpha.flip(dims=[1])
 
     return n_interp, alpha
 
