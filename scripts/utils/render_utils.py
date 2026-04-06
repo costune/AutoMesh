@@ -231,6 +231,49 @@ def save_texture(texture: torch.Tensor, path: str):
     print(f"[render] 纹理已保存: {path}")
 
 
+def render_normals(
+    verts: torch.Tensor,
+    faces: torch.Tensor,
+    normals: torch.Tensor,
+    mvp: torch.Tensor,
+    img_h: int,
+    img_w: int,
+) -> tuple:
+    """
+    渲染世界空间顶点法向量图。
+
+    Parameters
+    ----------
+    verts   : (1, N, 3) 本地坐标
+    faces   : (M, 3) int32
+    normals : (1, N, 3) 顶点法向量（单位向量，世界空间）
+    mvp     : (1, 4, 4) MVP 矩阵
+    img_h, img_w : 输出分辨率
+
+    Returns
+    -------
+    normal_img : (1, H, W, 3) 逐像素法向量，值域 [-1, 1]，背景为 0
+    alpha      : (1, H, W, 1) 可见性 mask
+    """
+    glctx = get_glctx(verts.device.type)
+
+    clip = apply_mvp(verts, mvp)
+    rast, _ = dr.rasterize(glctx, clip, faces, resolution=[img_h, img_w])
+
+    # 插值顶点法向量到每个像素
+    n_interp, _ = dr.interpolate(normals, rast, faces)   # (1, H, W, 3)
+
+    alpha = (rast[..., 3:4] > 0).float()   # (1, H, W, 1)
+
+    # 插值后重归一化（三角形内部插值会破坏单位长度）
+    n_interp = n_interp / (n_interp.norm(dim=-1, keepdim=True) + 1e-8)
+
+    # 背景像素置零
+    n_interp = n_interp * alpha
+
+    return n_interp, alpha
+
+
 def upsample_texture(
     texture: torch.nn.Parameter,
     new_size: int,

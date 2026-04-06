@@ -59,6 +59,7 @@ from utils.camera_utils import (
 from utils.render_utils import (
     prepare_mesh_buffers,
     render_texture,
+    render_normals,
     texture_loss,
     create_texture,
     upsample_texture,
@@ -404,6 +405,8 @@ def parse_args():
     p.add_argument("--device",      default="cuda", help="计算设备")
     p.add_argument("--skip_refine", action="store_true", help="跳过迭代精炼阶段")
     p.add_argument("--save_hf_mesh",action="store_true", help="保存高度场 PLY Mesh")
+    p.add_argument("--save_normals", action="store_true",
+                   help="对所有 COLMAP 相机渲染法向量图并保存到 output/normal_maps/")
     # Mesh 对齐到稀疏点云
     p.add_argument("--points3d", default=None,
                    help="COLMAP points3D.txt 路径；提供后在高度场转换前自动对齐 Mesh 到点云")
@@ -525,6 +528,64 @@ def main():
             img = cv2.imread(cam["image_path"])
             if img is not None:
                 cam["img_h"], cam["img_w"] = img.shape[:2]
+
+    # ------------------------------------------------------------------
+    # 步骤 1.5（可选）：渲染所有 COLMAP 视角的法向量图
+    # ------------------------------------------------------------------
+    if args.save_normals:
+        import trimesh as _trimesh_normals
+        print("\n[步骤 1.5] 计算顶点法向量并渲染法向量图 ...")
+
+        # 用 trimesh 自动计算顶点法向量（面法向量加权平均）
+        _mesh_for_normals = _trimesh_normals.Trimesh(
+            vertices=vertices, faces=faces, process=False
+        )
+        vnormals = np.asarray(_mesh_for_normals.vertex_normals, dtype=np.float32)  # (N, 3)
+        print(f"  顶点法向量形状: {vnormals.shape}")
+
+        # 上传到 GPU
+        verts_t_n  = torch.tensor(vertices,  dtype=torch.float32, device=device).unsqueeze(0)
+        faces_t_n  = torch.tensor(faces,     dtype=torch.int32,   device=device).contiguous()
+        vnorms_t   = torch.tensor(vnormals,  dtype=torch.float32, device=device).unsqueeze(0)
+
+        normal_maps_dir = os.path.join(args.output, "normal_maps")
+        os.makedirs(normal_maps_dir, exist_ok=True)
+
+        saved_count = 0
+        for cam in cameras:
+            if cam["img_w"] is None or cam["img_h"] is None:
+                continue
+            img_w, img_h = cam["img_w"], cam["img_h"]
+
+            mvp_np = build_mvp_matrix(cam["K"], cam["W2C"], img_w, img_h)
+            mvp    = mvp_to_tensor(mvp_np, device)
+
+            with torch.no_grad():
+                n_img, alpha = render_normals(
+                    verts_t_n, faces_t_n, vnorms_t, mvp, img_h, img_w
+                )
+
+            if alpha.sum() < 10:
+                continue
+
+            # n_img: (1, H, W, 3) ∈ [-1, 1]，映射到 [0, 255]（标准法向量图编码）
+            n_np = n_img.cpu().squeeze(0).numpy()           # (H, W, 3)
+            n_vis = np.clip((n_np * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
+
+            # 背景（alpha=0）置为 128（中性灰，对应法向量 0）
+            alpha_np = alpha.cpu().squeeze(0).squeeze(-1).numpy().astype(bool)  # (H, W)
+            n_vis[~alpha_np] = 128
+
+            out_path = os.path.join(normal_maps_dir, f"{cam['name']}_normal.png")
+            # 标准法向量图：R=X, G=Y, B=Z，OpenCV 写入时转 BGR
+            cv2.imwrite(out_path, cv2.cvtColor(n_vis, cv2.COLOR_RGB2BGR))
+            saved_count += 1
+
+        # 释放临时 GPU Tensor
+        del verts_t_n, faces_t_n, vnorms_t
+        torch.cuda.empty_cache()
+
+        print(f"  已保存 {saved_count} 张法向量图 → {normal_maps_dir}")
 
     # ------------------------------------------------------------------
     # 步骤 2：准备 GPU Tensor
