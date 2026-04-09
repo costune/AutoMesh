@@ -199,6 +199,8 @@ def optimize_texture(
     stage_name: str = "T_basic",
     lambda_mse: float = 0.8,
     lambda_ssim: float = 0.2,
+    save_interval: int = 20,
+    progress_dir: str = None,
     device: str = "cuda",
 ):
     """
@@ -206,9 +208,11 @@ def optimize_texture(
 
     Parameters
     ----------
-    cameras : list of dict，每个 dict 需包含 K, W2C, img_w, img_h, image_path
-              image_path 可为 None（新视角无参考图像时跳过该相机）
-    n_epochs : 优化轮数
+    cameras       : list of dict，每个 dict 需包含 K, W2C, img_w, img_h, image_path
+                    image_path 可为 None（新视角无参考图像时跳过该相机）
+    n_epochs      : 优化轮数
+    save_interval : 每隔多少 epoch 保存进度渲染图（0 表示不保存）
+    progress_dir  : 进度图保存目录；None 表示不保存
     """
     optimizer = torch.optim.Adam([texture], lr=lr)
 
@@ -219,6 +223,9 @@ def optimize_texture(
         return
 
     print(f"\n[{stage_name}] 开始优化: {n_epochs} epochs × {len(valid_cameras)} 相机")
+
+    # 取第一个有效相机用于进度渲染
+    vis_cam = valid_cameras[0]
 
     for epoch in range(n_epochs):
         t0 = time.time()
@@ -288,12 +295,213 @@ def optimize_texture(
                 f"loss={avg_loss:.5f} | cams={cam_count} | {elapsed:.1f}s"
             )
 
+        # 进度渲染图
+        if progress_dir and save_interval > 0 and (
+            (epoch + 1) % save_interval == 0 or epoch == 0
+        ):
+            os.makedirs(progress_dir, exist_ok=True)
+            vis_w = vis_cam["img_w"] or 512
+            vis_h = vis_cam["img_h"] or 512
+            mvp_vis = mvp_to_tensor(
+                build_mvp_matrix(vis_cam["K"], vis_cam["W2C"], vis_w, vis_h), device
+            )
+            with torch.no_grad():
+                vis_color, _ = render_texture(
+                    verts_t, faces_t, uv_t, texture, mvp_vis, vis_h, vis_w
+                )
+            vis_np = (
+                vis_color.cpu().squeeze(0).clamp(0, 1).numpy() * 255
+            ).astype(np.uint8)
+            save_path = os.path.join(progress_dir, f"epoch_{epoch+1:04d}.png")
+            cv2.imwrite(save_path, cv2.cvtColor(vis_np, cv2.COLOR_RGB2BGR))
+
     print(f"[{stage_name}] 优化完成")
 
 
 # ---------------------------------------------------------------------------
 # 迭代精炼
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 几何优化辅助
+# ---------------------------------------------------------------------------
+
+def _precompute_edges(faces_np: np.ndarray) -> np.ndarray:
+    """从面片数组提取所有唯一无向边，返回 (E, 2) int32。"""
+    e = np.vstack([
+        faces_np[:, [0, 1]],
+        faces_np[:, [1, 2]],
+        faces_np[:, [2, 0]],
+    ])
+    e = np.sort(e, axis=1)
+    return np.unique(e, axis=0).astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
+# 几何优化
+# ---------------------------------------------------------------------------
+
+def optimize_geometry(
+    verts_t: torch.Tensor,
+    faces_t: torch.Tensor,
+    uv_t: torch.Tensor,
+    texture: torch.nn.Parameter,
+    cameras: list,
+    n_epochs: int,
+    lr: float = 1e-3,
+    lambda_smooth: float = 0.1,
+    lambda_reg: float = 0.01,
+    stage_name: str = "geo_opt",
+    save_interval: int = 20,
+    progress_dir: str = None,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    固定纹理，对所有顶点进行全三维 XYZ 自由优化。
+
+    使用基于边拓扑的 Laplacian 平滑正则化（适用于任意流形 Mesh），
+    不再依赖高度场格点结构。
+
+    Parameters
+    ----------
+    verts_t       : (1, N, 3) 初始顶点，本地坐标（米）
+    lr            : Adam 学习率
+    lambda_smooth : edge-based Laplacian 平滑权重
+    lambda_reg    : delta_xyz L2 正则化权重
+    save_interval : 每隔多少 epoch 保存一张进度渲染图（0 表示不保存）
+    progress_dir  : 进度图保存目录；None 表示不保存
+
+    Returns
+    -------
+    (1, N, 3) 优化后顶点张量（detached，不带梯度）
+    """
+    N = verts_t.shape[1]
+
+    # 预计算边拓扑（用于 Laplacian）
+    faces_np = faces_t.cpu().numpy()
+    edges_np = _precompute_edges(faces_np)
+    edges_t  = torch.tensor(edges_np, dtype=torch.long, device=device)
+    print(f"[{stage_name}] 顶点数: {N}, 面数: {len(faces_np)}, 边数: {len(edges_np)}")
+
+    # 可学习的全三维偏移量，初始化为 0
+    delta_xyz = torch.nn.Parameter(torch.zeros(N, 3, device=device))
+    optimizer = torch.optim.Adam([delta_xyz], lr=lr)
+
+    valid_cameras = [c for c in cameras if c.get("image_path") is not None]
+    if len(valid_cameras) == 0:
+        print(f"[{stage_name}] 警告：无有效参考图像，跳过几何优化")
+        return verts_t.detach()
+
+    print(f"\n[{stage_name}] 开始几何优化: {n_epochs} epochs × {len(valid_cameras)} 相机")
+
+    verts_base    = verts_t.detach()[0]   # (N, 3)
+    texture_fixed = texture.detach()
+
+    # 取第一个有效相机用于进度渲染
+    vis_cam = valid_cameras[0]
+
+    for epoch in range(n_epochs):
+        t0 = time.time()
+        epoch_loss = 0.0
+        cam_count  = 0
+
+        # 当前优化后的顶点
+        verts_new = (verts_base + delta_xyz).unsqueeze(0)  # (1, N, 3)
+
+        for cam in valid_cameras:
+            img_w = cam["img_w"]
+            img_h = cam["img_h"]
+
+            try:
+                gt = load_and_resize_image(cam["image_path"], img_h, img_w, device)
+            except Exception:
+                continue
+
+            mvp_np = build_mvp_matrix(cam["K"], cam["W2C"], img_w, img_h)
+            mvp    = mvp_to_tensor(mvp_np, device)
+
+            color, alpha = render_texture(
+                verts_new, faces_t, uv_t, texture_fixed, mvp, img_h, img_w
+            )
+
+            if alpha.sum() < 10:
+                continue
+
+            # 合并渲染 alpha 与图像 mask
+            mask_path = cam.get("mask_path")
+            if mask_path and os.path.exists(mask_path):
+                try:
+                    img_mask = load_mask_as_tensor(mask_path, img_h, img_w, device)
+                    effective_mask = alpha * img_mask
+                except Exception:
+                    effective_mask = alpha
+            else:
+                effective_mask = alpha
+
+            if effective_mask.sum() < 10:
+                continue
+
+            # 光度损失
+            loss_photo = texture_loss(color, gt, effective_mask)
+
+            # Edge-based Laplacian 平滑正则化
+            dv  = delta_xyz[edges_t[:, 0]] - delta_xyz[edges_t[:, 1]]  # (E, 3)
+            lap = dv.pow(2).mean()
+
+            # L2 幅值正则化
+            reg = delta_xyz.pow(2).mean()
+
+            loss = loss_photo + lambda_smooth * lap + lambda_reg * reg
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            cam_count  += 1
+
+        elapsed = time.time() - t0
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            avg_loss  = epoch_loss / max(cam_count, 1)
+            dxyz_abs  = delta_xyz.detach().abs()
+            print(
+                f"  [{stage_name}] epoch {epoch+1:3d}/{n_epochs} | "
+                f"loss={avg_loss:.5f} | cams={cam_count} | "
+                f"max|delta_xyz|={dxyz_abs.max():.4f} m | {elapsed:.1f}s"
+            )
+
+        # 进度渲染图
+        if progress_dir and save_interval > 0 and (
+            (epoch + 1) % save_interval == 0 or epoch == 0
+        ):
+            os.makedirs(progress_dir, exist_ok=True)
+            vis_w = vis_cam["img_w"] or 512
+            vis_h = vis_cam["img_h"] or 512
+            mvp_vis = mvp_to_tensor(
+                build_mvp_matrix(vis_cam["K"], vis_cam["W2C"], vis_w, vis_h), device
+            )
+            with torch.no_grad():
+                vis_color, _ = render_texture(
+                    verts_new, faces_t, uv_t, texture_fixed, mvp_vis, vis_h, vis_w
+                )
+            vis_np = (
+                vis_color.cpu().squeeze(0).clamp(0, 1).numpy() * 255
+            ).astype(np.uint8)
+            save_path = os.path.join(progress_dir, f"epoch_{epoch+1:04d}.png")
+            cv2.imwrite(save_path, cv2.cvtColor(vis_np, cv2.COLOR_RGB2BGR))
+
+    # 应用最终偏移，返回优化后顶点
+    with torch.no_grad():
+        verts_opt = (verts_base + delta_xyz).unsqueeze(0)  # (1, N, 3)
+
+    dxyz_np = delta_xyz.detach().cpu().numpy()
+    print(
+        f"[{stage_name}] 几何优化完成 | "
+        f"delta_xyz: mean={np.abs(dxyz_np).mean():.4f} m, "
+        f"max={np.abs(dxyz_np).max():.4f} m"
+    )
+    return verts_opt.detach()
+
 
 class IdentityRestorer:
     """恢复网络占位符：直接返回输入图像（无增强）。"""
@@ -409,11 +617,24 @@ def parse_args():
     p.add_argument("--images",      required=True, help="输入卫星图像目录")
     p.add_argument("--masks",       default=None,  help="图像 mask 目录（.npy 或 .png，与图像同名）；不指定则不使用 mask")
     p.add_argument("--output",      required=True, help="输出目录")
-    p.add_argument("--hf_res",      type=int, default=512,  help="高度场分辨率")
+    p.add_argument("--hf_res",      type=int, default=512,  help="高度场 XY 采样分辨率（同时决定体素 XY 格数）")
+    p.add_argument("--voxel_z_res", type=int, default=128,
+                   help="体素化 Z 方向层数（越大墙面越精细，默认 128）")
+    p.add_argument("--simplify_faces", type=int, default=0,
+                   help="quadric 简化目标面数（0 = 不简化；推荐约为 marching cubes 面数的 20%）")
     p.add_argument("--atlas_size",  type=int, default=8192, help="纹理 atlas 最终分辨率")
     p.add_argument("--init_atlas_size", type=int, default=512,
                    help="渐进分辨率起始尺寸（2 的幂，如 512）；None 表示直接用 atlas_size")
-    p.add_argument("--basic_epochs",type=int, default=100,  help="T_basic 优化轮数")
+    p.add_argument("--basic_texture_epochs", type=int, default=100,
+                   help="T_basic 纹理优化轮数（几何固定）")
+    p.add_argument("--basic_geometry_epochs", type=int, default=0,
+                   help="T_basic 后的几何优化轮数（纹理固定，default=0 表示跳过）")
+    p.add_argument("--geo_lr",     type=float, default=1e-3,
+                   help="几何优化 Adam 学习率（米/step，default=1e-3）")
+    p.add_argument("--lambda_smooth", type=float, default=0.1,
+                   help="几何优化 Laplacian 平滑权重（default=0.1）")
+    p.add_argument("--lambda_reg",    type=float, default=0.01,
+                   help="几何优化 delta_z L2 正则化权重（default=0.01）")
     p.add_argument("--refine_iters",type=int, default=2,    help="精炼迭代次数")
     p.add_argument("--refine_epochs",type=int, default=20,  help="每轮精炼优化步数")
     p.add_argument("--max_novel_cams",type=int,default=64,  help="最大新视角相机数")
@@ -506,13 +727,25 @@ def main():
     # ------------------------------------------------------------------
     # 步骤 0：NeuS Mesh → 2.5D 高度场 Mesh
     # ------------------------------------------------------------------
-    print("\n[步骤 0] 生成 2.5D 高度场 Mesh ...")
+    print("\n[步骤 0] 生成流形 Mesh（体素化 + marching cubes → 简化 → Tutte UV）...")
     hf = build_heightfield_mesh(
         mesh_ply_path=args.mesh,
         mesh_info_path=args.mesh_info,
         resolution=args.hf_res,
+        voxel_z_res=args.voxel_z_res,
+        simplify_faces=args.simplify_faces,
         aligned_vertices=aligned_verts,
     )
+
+    # 始终保存 marching cubes 原始 Mesh（简化/UV 之前）
+    import trimesh as _trimesh_mc
+    mc_ply_path = os.path.join(args.output, "marching_cubes_mesh.ply")
+    mc_mesh = _trimesh_mc.Trimesh(
+        vertices=hf["mc_vertices"], faces=hf["mc_faces"], process=False
+    )
+    mc_mesh.export(mc_ply_path)
+    print(f"[步骤 0] marching cubes 原始 Mesh 已保存: {mc_ply_path} "
+          f"({len(hf['mc_vertices'])} 顶点, {len(hf['mc_faces'])} 面)")
 
     if args.save_hf_mesh:
         hf_ply_path = os.path.join(args.output, "heightfield.ply")
@@ -649,7 +882,7 @@ def main():
     print("\n[步骤 4] 基础纹理 T_basic 优化 ...")
     if use_progressive:
         schedule = build_progressive_schedule(
-            args.init_atlas_size, args.atlas_size, args.basic_epochs
+            args.init_atlas_size, args.atlas_size, args.basic_texture_epochs
         )
         print(f"  渐进调度: {[(sz, ep) for sz, ep in schedule]}")
         for stage_size, stage_epochs in schedule:
@@ -657,27 +890,65 @@ def main():
             if cur_size != stage_size:
                 texture = upsample_texture(texture, stage_size)
                 print(f"  [进度] 上采样纹理: {cur_size}×{cur_size} → {stage_size}×{stage_size}")
+            stage_name = f"T_basic_{stage_size}"
             optimize_texture(
                 verts_t, faces_t, uv_t, texture,
                 valid_cams,
                 n_epochs=stage_epochs,
                 lr=args.lr,
-                stage_name=f"T_basic_{stage_size}",
+                stage_name=stage_name,
+                progress_dir=os.path.join(args.output, "progress", stage_name),
                 device=device,
             )
     else:
         optimize_texture(
             verts_t, faces_t, uv_t, texture,
             valid_cams,
-            n_epochs=args.basic_epochs,
+            n_epochs=args.basic_texture_epochs,
             lr=args.lr,
             stage_name="T_basic",
+            progress_dir=os.path.join(args.output, "progress", "T_basic"),
             device=device,
         )
 
     # 保存 T_basic
     basic_tex_path = os.path.join(args.output, "texture_basic.png")
     save_texture(texture, basic_tex_path)
+
+    # ------------------------------------------------------------------
+    # 步骤 4.5（可选）：几何优化（固定纹理，优化顶点 Z）
+    # ------------------------------------------------------------------
+    if args.basic_geometry_epochs > 0:
+        print("\n[步骤 4.5] 几何优化（固定纹理，全三维自由优化顶点 XYZ）...")
+        verts_t = optimize_geometry(
+            verts_t=verts_t,
+            faces_t=faces_t,
+            uv_t=uv_t,
+            texture=texture,
+            cameras=valid_cams,
+            n_epochs=args.basic_geometry_epochs,
+            lr=args.geo_lr,
+            lambda_smooth=args.lambda_smooth,
+            lambda_reg=args.lambda_reg,
+            stage_name="geo_opt",
+            progress_dir=os.path.join(args.output, "progress", "geo_opt"),
+            device=device,
+        )
+
+        # 同步更新 numpy vertices（供后续 OBJ 导出使用）
+        vertices = verts_t.cpu().squeeze(0).numpy()  # (N, 3)
+
+        # 保存优化后几何
+        import trimesh as _trimesh_geo
+        geo_ply_path = os.path.join(args.output, "geometry_optimized.ply")
+        _trimesh_geo.Trimesh(
+            vertices=vertices.astype(np.float64),
+            faces=faces,
+            process=False,
+        ).export(geo_ply_path)
+        print(f"  [几何] 已保存优化后 Mesh: {geo_ply_path}")
+    else:
+        print("\n[步骤 4.5] 跳过几何优化（--basic_geometry_epochs=0）")
 
     # ------------------------------------------------------------------
     # 步骤 5：迭代精炼（可选）

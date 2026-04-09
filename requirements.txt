@@ -8,6 +8,11 @@ pytorch-msssim>=1.0.0
 scipy>=1.10.0
 opencv-python>=4.8.0
 
+# 体素化 + UV 展开依赖：
+xatlas>=0.0.8
+scikit-image>=0.21.0
+fast-simplification>=0.1.0
+
 # FLUX-Schnell 恢复网络依赖（--use_flux 时需要）：
 # pip install diffusers transformers sentencepiece accelerate
 diffusers>=0.30.0
