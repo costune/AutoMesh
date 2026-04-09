@@ -638,6 +638,17 @@ def parse_args():
     p.add_argument("--refine_iters",type=int, default=2,    help="精炼迭代次数")
     p.add_argument("--refine_epochs",type=int, default=20,  help="每轮精炼优化步数")
     p.add_argument("--max_novel_cams",type=int,default=64,  help="最大新视角相机数")
+    # UAV 新视角相机参数
+    p.add_argument("--uav_height",    type=float, default=80.0,
+                   help="UAV 相机高度，相对 Mesh 最高点（米，默认 80）")
+    p.add_argument("--uav_pitch",     type=float, default=45.0,
+                   help="UAV 俯仰角（度，正值向下，默认 45）")
+    p.add_argument("--uav_grid",      type=float, default=60.0,
+                   help="UAV 相机水平网格间距（米，默认 60）")
+    p.add_argument("--uav_margin",    type=float, default=20.0,
+                   help="UAV 相机 AABB 外扩边距（米，默认 20）")
+    p.add_argument("--uav_fov",       type=float, default=60.0,
+                   help="UAV 相机水平 FOV（度，默认 60）")
     p.add_argument("--lr",          type=float, default=0.01, help="Adam 学习率")
     p.add_argument("--device",      default="cuda", help="计算设备")
     p.add_argument("--skip_refine", action="store_true", help="跳过迭代精炼阶段")
@@ -959,6 +970,11 @@ def main():
             x_min=x_min, x_max=x_max,
             y_min=y_min, y_max=y_max,
             z_max=z_max,
+            uav_height=args.uav_height,
+            pitch_deg=args.uav_pitch,
+            grid_spacing=args.uav_grid,
+            aabb_margin=args.uav_margin,
+            fov_deg=args.uav_fov,
         )
         novel_cams = subsample_novel_cameras(novel_cams, args.max_novel_cams)
         print(f"  生成 {len(novel_cams)} 个新视角相机")

@@ -85,10 +85,10 @@ def generate_novel_cameras(
     y_min: float,
     y_max: float,
     z_max: float,
-    uav_height: float = 450.0,
+    uav_height: float = 80.0,
     pitch_deg: float = 45.0,
-    grid_spacing: float = 150.0,
-    aabb_margin: float = 100.0,
+    grid_spacing: float = 60.0,
+    aabb_margin: float = 20.0,
     img_w: int = 1024,
     img_h: int = 1024,
     fov_deg: float = 60.0,
@@ -99,9 +99,9 @@ def generate_novel_cameras(
     Parameters
     ----------
     x_min, x_max, y_min, y_max : Mesh 水平范围（本地坐标，米）
-    z_max : Mesh 最高点（本地坐标，米）
-    uav_height    : 相机高度（相对 z_max，米）
-    pitch_deg     : 俯仰角（正值=向下倾斜，度）
+    z_max   : Mesh 最高点（本地坐标，米）
+    uav_height    : 相机高度（相对 z_max，米）；默认 80m，适合百米级城区场景
+    pitch_deg     : 俯仰角（正值=向下倾斜，度）；45° 为典型斜视无人机视角
     grid_spacing  : 相机水平网格间距（米）
     aabb_margin   : AABB 外扩边距（米）
     img_w, img_h  : 渲染分辨率
@@ -135,9 +135,6 @@ def generate_novel_cameras(
         "N": np.array([0.0, 1.0, 0.0]),
     }
 
-    # 场景中心（水平）
-    scene_cx = (x_min + x_max) / 2.0
-    scene_cy = (y_min + y_max) / 2.0
     scene_cz = z_max  # 俯视目标点在场景最高面
 
     K = _build_pinhole_K(fov_deg, img_w, img_h)
@@ -146,17 +143,17 @@ def generate_novel_cameras(
     for xi, x in enumerate(xs):
         for yi, y in enumerate(ys):
             for dir_name, forward in directions.items():
-                # 45° 俯仰：相机水平偏移 = height * tan(pitch)
+                # 俯仰：水平偏移 = height * tan(pitch)，使相机向 forward 方向倾斜
                 horizontal_offset = uav_height * np.tan(np.deg2rad(pitch_deg))
 
-                # 相机位置：在 forward 方向偏移
+                # 相机位置：在 -forward 方向偏移（保持俯视角）
                 eye = np.array([
                     x - forward[0] * horizontal_offset,
                     y - forward[1] * horizontal_offset,
                     cam_z,
                 ], dtype=np.float64)
 
-                # 目标点：沿 forward 方向的地面点
+                # 目标点：沿 forward 方向的地面点（相机看向的地方）
                 target = np.array([
                     x + forward[0] * horizontal_offset * 0.5,
                     y + forward[1] * horizontal_offset * 0.5,
