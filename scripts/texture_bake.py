@@ -28,8 +28,7 @@ Off-Nadir Satellite Images" (2512.07527v2) 中的两阶段纹理生成方法：
     --images    data/JAX_068/images \\
     --output    data/JAX_068/textured \\
     --use_flux \\
-    --flux_weights_dir /path/to/weights \\  # 可选，默认使用 HuggingFace 缓存
-    --flux_strength 0.3
+    --flux_weights_dir /path/to/weights   # 可选，默认使用 HuggingFace 缓存
 """
 
 import os
@@ -622,7 +621,7 @@ def parse_args():
                    help="体素化 Z 方向层数（越大墙面越精细，默认 128）")
     p.add_argument("--simplify_faces", type=int, default=0,
                    help="quadric 简化目标面数（0 = 不简化；推荐约为 marching cubes 面数的 20%）")
-    p.add_argument("--atlas_size",  type=int, default=8192, help="纹理 atlas 最终分辨率")
+    p.add_argument("--atlas_size",  type=int, default=2048, help="纹理 atlas 最终分辨率")
     p.add_argument("--init_atlas_size", type=int, default=512,
                    help="渐进分辨率起始尺寸（2 的幂，如 512）；None 表示直接用 atlas_size")
     p.add_argument("--basic_texture_epochs", type=int, default=100,
@@ -631,13 +630,13 @@ def parse_args():
                    help="T_basic 后的几何优化轮数（纹理固定，default=0 表示跳过）")
     p.add_argument("--geo_lr",     type=float, default=1e-3,
                    help="几何优化 Adam 学习率（米/step，default=1e-3）")
-    p.add_argument("--lambda_smooth", type=float, default=0.1,
+    p.add_argument("--lambda_smooth", type=float, default=0.01,
                    help="几何优化 Laplacian 平滑权重（default=0.1）")
     p.add_argument("--lambda_reg",    type=float, default=0.01,
                    help="几何优化 delta_z L2 正则化权重（default=0.01）")
-    p.add_argument("--refine_iters",type=int, default=2,    help="精炼迭代次数")
-    p.add_argument("--refine_epochs",type=int, default=20,  help="每轮精炼优化步数")
-    p.add_argument("--max_novel_cams",type=int,default=64,  help="最大新视角相机数")
+    p.add_argument("--refine_iters",type=int, default=3,    help="精炼迭代次数")
+    p.add_argument("--refine_epochs",type=int, default=100,  help="每轮精炼优化步数")
+    p.add_argument("--max_novel_cams",type=int,default=96,  help="最大新视角相机数")
     # UAV 新视角相机参数
     p.add_argument("--uav_height",    type=float, default=80.0,
                    help="UAV 相机高度，相对 Mesh 最高点（米，默认 80）")
@@ -645,8 +644,8 @@ def parse_args():
                    help="UAV 俯仰角（度，正值向下，默认 45）")
     p.add_argument("--uav_grid",      type=float, default=60.0,
                    help="UAV 相机水平网格间距（米，默认 60）")
-    p.add_argument("--uav_margin",    type=float, default=20.0,
-                   help="UAV 相机 AABB 外扩边距（米，默认 20）")
+    p.add_argument("--uav_margin",    type=float, default=0.0,
+                   help="UAV 相机 AABB 外扩边距（米，默认 0）")
     p.add_argument("--uav_fov",       type=float, default=60.0,
                    help="UAV 相机水平 FOV（度，默认 60）")
     p.add_argument("--lr",          type=float, default=0.01, help="Adam 学习率")
@@ -664,20 +663,31 @@ def parse_args():
                    help="trimmed-median 每轮丢弃的最差对比例，默认 0.3")
     p.add_argument("--align_iters", type=int,   default=20,
                    help="精对齐最大迭代次数，默认 20")
-    # FLUX-Schnell 恢复网络参数
+    # FLUX FlowEdit 参数
     p.add_argument("--use_flux",         action="store_true",
-                   help="使用 FLUX-Schnell 图像恢复网络增强新视角（需要 diffusers）")
-    p.add_argument("--flux_model",       default="black-forest-labs/FLUX.1-schnell",
+                   help="使用 FLUX FlowEdit 图像编辑网络增强新视角（需要 diffusers）")
+    p.add_argument("--flux_model",       default="black-forest-labs/FLUX.1-dev",
                    help="FLUX 模型 ID 或本地路径")
     p.add_argument("--flux_weights_dir", default="/dexmal-fa-ltl/weights",
-                   help="HuggingFace 权重缓存目录（默认使用 HuggingFace 标准缓存）")
-    p.add_argument("--flux_strength",    type=float, default=0.3,
-                   help="img2img 强度 (0~1)，越低越保留输入结构")
+                   help="HuggingFace 权重缓存目录")
     p.add_argument("--flux_res",         type=int,   default=1024,
-                   help="FLUX 内部处理分辨率（正方形，之后缩放回原尺寸）")
-    p.add_argument("--flux_prompt",
-                   default="high quality aerial urban view, sharp building details, photorealistic",
-                   help="FLUX 引导提示词")
+                   help="FLUX 内部处理分辨率（正方形，之后缩放回原尺寸，默认 1024）")
+    p.add_argument("--flux_src_prompt",  default=None,
+                   help="FlowEdit 源提示词（描述退化渲染图）；None 使用内置默认值")
+    p.add_argument("--flux_tar_prompt",  default=None,
+                   help="FlowEdit 目标提示词（描述清晰增强图）；None 使用内置默认值")
+    p.add_argument("--flux_T_steps",     type=int,   default=28,
+                   help="FlowEdit 总时间步数（默认 28；步数越多质量越高但越慢）")
+    p.add_argument("--flux_n_avg",       type=int,   default=1,
+                   help="速度场蒙特卡洛平均次数（1 最快；3-5 更稳定，显存/时间翻倍）")
+    p.add_argument("--flux_src_guidance",type=float, default=1.5,
+                   help="源方向引导强度（默认 1.5；控制退化特征的抑制力度）")
+    p.add_argument("--flux_tar_guidance",type=float, default=5.5,
+                   help="目标方向引导强度（默认 5.5；越高越清晰但越可能改变内容）")
+    p.add_argument("--flux_n_min",       type=int,   default=0,
+                   help="末尾切换为标准采样的步数（默认 0=全程 ODE，结构保留最好）")
+    p.add_argument("--flux_n_max",       type=int,   default=24,
+                   help="开始编辑的步数（默认 24，即跳过前 4 步热身）")
     return p.parse_args()
 
 
@@ -981,17 +991,24 @@ def main():
 
         # 恢复网络：根据 --use_flux 参数选择
         if args.use_flux:
-            from utils.flux_restorer import FluxRestorer
+            from utils.flux_restorer import FluxRestorer, DEFAULT_SRC_PROMPT, DEFAULT_TAR_PROMPT
             restorer = FluxRestorer(
                 model_id=args.flux_model,
                 cache_dir=args.flux_weights_dir,
                 flux_resolution=args.flux_res,
-                strength=args.flux_strength,
-                prompt=args.flux_prompt,
+                src_prompt=args.flux_src_prompt or DEFAULT_SRC_PROMPT,
+                tar_prompt=args.flux_tar_prompt or DEFAULT_TAR_PROMPT,
+                T_steps=args.flux_T_steps,
+                n_avg=args.flux_n_avg,
+                src_guidance=args.flux_src_guidance,
+                tar_guidance=args.flux_tar_guidance,
+                n_min=args.flux_n_min,
+                n_max=args.flux_n_max,
                 device=device,
             )
-            print(f"  [FLUX] 恢复网络已加载: {args.flux_model}")
-            print(f"  [FLUX] strength={args.flux_strength}, resolution={args.flux_res}")
+            print(f"  [FLUX] FlowEdit 已加载: {args.flux_model}")
+            print(f"  [FLUX] T_steps={args.flux_T_steps}, n_avg={args.flux_n_avg}, "
+                  f"src_guidance={args.flux_src_guidance}, tar_guidance={args.flux_tar_guidance}")
         else:
             restorer = IdentityRestorer()
             print("  [注意] 使用 IdentityRestorer（无图像增强）")
