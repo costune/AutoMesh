@@ -59,6 +59,7 @@ from utils.render_utils import (
     prepare_mesh_buffers,
     render_texture,
     render_normals,
+    build_mip_stack,
     texture_loss,
     create_texture,
     upsample_texture,
@@ -200,6 +201,7 @@ def optimize_texture(
     lambda_ssim: float = 0.2,
     save_interval: int = 20,
     progress_dir: str = None,
+    max_mip_level: int = None,
     device: str = "cuda",
 ):
     """
@@ -249,9 +251,10 @@ def optimize_texture(
             )
             mvp = mvp_to_tensor(mvp_np, device)
 
-            # 可微分渲染
+            # 可微分渲染（auto-mip，支持梯度反传；max_mip_level 防止极小 mip 层过度模糊）
             color, alpha = render_texture(
-                verts_t, faces_t, uv_t, texture, mvp, img_h, img_w
+                verts_t, faces_t, uv_t, texture, mvp, img_h, img_w,
+                max_mip_level=max_mip_level,
             )
 
             # 检查是否有可见像素
@@ -353,6 +356,7 @@ def optimize_geometry(
     stage_name: str = "geo_opt",
     save_interval: int = 20,
     progress_dir: str = None,
+    max_mip_level: int = None,
     device: str = "cuda",
 ) -> torch.Tensor:
     """
@@ -420,7 +424,8 @@ def optimize_geometry(
             mvp    = mvp_to_tensor(mvp_np, device)
 
             color, alpha = render_texture(
-                verts_new, faces_t, uv_t, texture_fixed, mvp, img_h, img_w
+                verts_new, faces_t, uv_t, texture_fixed, mvp, img_h, img_w,
+                max_mip_level=max_mip_level,
             )
 
             if alpha.sum() < 10:
@@ -518,20 +523,30 @@ def run_iterative_refinement(
     n_epochs: int,
     restorer,
     output_dir: str,
+    max_mip_level: int = None,
     device: str = "cuda",
 ):
     """
     迭代精炼循环（论文 §3.2）。
 
     每次迭代：
-      1. 从当前纹理渲染新视角图像 I_low
-      2. 经恢复网络得到伪真值 I_target = D(I_low)
-      3. 以 I_target 为监督优化纹理（20 epochs）
+      1. 预构建 mip stack（推理加速：避免每张图重复构建 mip chain）
+      2. 从当前纹理渲染新视角图像 I_low
+      3. 经恢复网络得到伪真值 I_target = D(I_low)
+      4. 以 I_target 为监督优化纹理（20 epochs）
+      5. 优化结束后 mip stack 已过期，下轮开头重建
     """
     print(f"\n[精炼] 开始迭代精炼: {n_iters} 轮 × {n_epochs} epochs")
 
     for it in range(n_iters):
         print(f"\n[精炼] === 迭代 {it+1}/{n_iters} ===")
+
+        # 预构建 mip stack（纹理在本次 novel view 渲染阶段保持不变，可安全复用）
+        with torch.no_grad():
+            mip_stack = build_mip_stack(texture.data, max_levels=max_mip_level)
+        print(f"  [mip] 已构建 mip pyramid: {len(mip_stack)} 层 "
+              f"({mip_stack[0].shape[1]}×{mip_stack[0].shape[2]} → "
+              f"{mip_stack[-1].shape[1]}×{mip_stack[-1].shape[2]})")
 
         # 为每个新视角相机渲染并生成伪真值
         refined_cameras = []
@@ -547,7 +562,9 @@ def run_iterative_refinement(
 
             with torch.no_grad():
                 I_low, alpha = render_texture(
-                    verts_t, faces_t, uv_t, texture, mvp, img_h, img_w
+                    verts_t, faces_t, uv_t, texture, mvp, img_h, img_w,
+                    max_mip_level=max_mip_level,
+                    mip_stack=mip_stack,
                 )
 
             if alpha.sum() < 100:
@@ -598,6 +615,7 @@ def run_iterative_refinement(
             refined_cameras,
             n_epochs=n_epochs,
             stage_name=f"refine_iter{it+1}",
+            max_mip_level=max_mip_level,
             device=device,
         )
 
@@ -616,7 +634,7 @@ def parse_args():
     p.add_argument("--images",      required=True, help="输入卫星图像目录")
     p.add_argument("--masks",       default=None,  help="图像 mask 目录（.npy 或 .png，与图像同名）；不指定则不使用 mask")
     p.add_argument("--output",      required=True, help="输出目录")
-    p.add_argument("--hf_res",      type=int, default=512,  help="高度场 XY 采样分辨率（同时决定体素 XY 格数）")
+    p.add_argument("--hf_res",      type=int, default=256,  help="高度场 XY 采样分辨率（同时决定体素 XY 格数）")
     p.add_argument("--voxel_z_res", type=int, default=128,
                    help="体素化 Z 方向层数（越大墙面越精细，默认 128）")
     p.add_argument("--simplify_faces", type=int, default=0,
@@ -649,6 +667,9 @@ def parse_args():
     p.add_argument("--uav_fov",       type=float, default=60.0,
                    help="UAV 相机水平 FOV（度，默认 60）")
     p.add_argument("--lr",          type=float, default=0.01, help="Adam 学习率")
+    p.add_argument("--max_mip_level", type=int, default=4,
+                   help="mip mapping 最大层级（0=仅用原始分辨率，4=最小 1/16 分辨率）。"
+                        "推荐：log2(atlas_size/output_size)+2，默认 4 适配 2048 atlas + 512 输出")
     p.add_argument("--device",      default="cuda", help="计算设备")
     p.add_argument("--skip_refine", action="store_true", help="跳过迭代精炼阶段")
     p.add_argument("--save_hf_mesh",action="store_true", help="保存高度场 PLY Mesh")
@@ -686,8 +707,12 @@ def parse_args():
                    help="目标方向引导强度（默认 5.5；越高越清晰但越可能改变内容）")
     p.add_argument("--flux_n_min",       type=int,   default=0,
                    help="末尾切换为标准采样的步数（默认 0=全程 ODE，结构保留最好）")
-    p.add_argument("--flux_n_max",       type=int,   default=24,
-                   help="开始编辑的步数（默认 24，即跳过前 4 步热身）")
+    p.add_argument("--flux_n_max",       type=int,   default=15,
+                   help="开始编辑的步数（默认 15，即跳过前 T_steps-15 步热身）")
+    p.add_argument("--flux_compile",     action="store_true",
+                   help="用 torch.compile 优化 Transformer（首次调用约 30s 预热，之后每步快 20-40%%）")
+    p.add_argument("--flux_xformers",    action="store_true",
+                   help="启用 xFormers memory-efficient attention（需安装 xformers）")
     return p.parse_args()
 
 
@@ -919,6 +944,7 @@ def main():
                 lr=args.lr,
                 stage_name=stage_name,
                 progress_dir=os.path.join(args.output, "progress", stage_name),
+                max_mip_level=args.max_mip_level,
                 device=device,
             )
     else:
@@ -929,6 +955,7 @@ def main():
             lr=args.lr,
             stage_name="T_basic",
             progress_dir=os.path.join(args.output, "progress", "T_basic"),
+            max_mip_level=args.max_mip_level,
             device=device,
         )
 
@@ -953,6 +980,7 @@ def main():
             lambda_reg=args.lambda_reg,
             stage_name="geo_opt",
             progress_dir=os.path.join(args.output, "progress", "geo_opt"),
+            max_mip_level=args.max_mip_level,
             device=device,
         )
 
@@ -1004,6 +1032,8 @@ def main():
                 tar_guidance=args.flux_tar_guidance,
                 n_min=args.flux_n_min,
                 n_max=args.flux_n_max,
+                use_compile=args.flux_compile,
+                use_xformers=args.flux_xformers,
                 device=device,
             )
             print(f"  [FLUX] FlowEdit 已加载: {args.flux_model}")
@@ -1021,6 +1051,7 @@ def main():
             n_epochs=args.refine_epochs,
             restorer=restorer,
             output_dir=args.output,
+            max_mip_level=args.max_mip_level,
             device=device,
         )
     else:

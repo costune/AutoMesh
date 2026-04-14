@@ -3,9 +3,16 @@
 
 流程：
   1. rasterize       : 将 Mesh 三角面光栅化，得到逐像素三角形 ID 和重心坐标
-  2. interpolate     : 插值 UV 坐标到每个像素
-  3. texture_sample  : 从 UV atlas 采样颜色（可微分）
+  2. interpolate     : 插值 UV 坐标到每个像素，同时计算 UV 屏幕空间微分（用于 mip LOD）
+  3. texture_sample  : 从 UV atlas 采样颜色（可微分），支持 mip mapping
   4. antialias       : 抗锯齿（用于梯度回传到顶点）
+
+Mip Mapping 说明：
+  - 优化阶段（需要梯度）：auto-mip 模式，nvdiffrast 内部从 base texture 自动生成 mip chain
+    并支持梯度反传。通过 max_mip_level 限制最低层级，防止采样到极小 mip 层导致过度模糊。
+  - 推理/可视化阶段（无需梯度）：可调用 build_mip_stack() 显式构建 mip pyramid，
+    传入 mip_stack 参数跳过每次前向的 mip 重建，提升推理速度。
+  - 纹理尺寸必须为 2 的幂（512/1024/2048/4096/8192），否则 nvdiffrast auto-mip 会报错。
 
 nvdiffrast 坐标约定：
   - 输入顶点为 clip-space 齐次坐标 (x, y, z, w)
@@ -84,6 +91,49 @@ def apply_mvp(
     return clip
 
 
+def build_mip_stack(
+    texture: torch.Tensor,
+    max_levels: int = None,
+) -> list:
+    """
+    显式构建 mip pyramid（各层级纹理列表），供推理时传入 render_texture 以避免
+    每次前向重复构建 mip chain。
+
+    纹理尺寸必须是 2 的幂；每层将宽高各减半直至 1x1 或达到 max_levels。
+
+    Parameters
+    ----------
+    texture   : (1, H, W, C) float32 CUDA Tensor，基础层纹理
+    max_levels: 最大 mip 层数（含第 0 层），None 表示生成完整 pyramid
+
+    Returns
+    -------
+    mip_list  : list of (1, H_i, W_i, C) Tensor，第 0 项为原始分辨率
+    """
+    h, w = texture.shape[1], texture.shape[2]
+    if (h & (h - 1)) != 0 or (w & (w - 1)) != 0:
+        raise ValueError(f"build_mip_stack: 纹理尺寸必须是 2 的幂，实际为 {h}x{w}")
+
+    mip_list = [texture]
+    cur = texture
+    level = 1
+    while True:
+        nh, nw = cur.shape[1] // 2, cur.shape[2] // 2
+        if nh < 1 or nw < 1:
+            break
+        if max_levels is not None and level >= max_levels:
+            break
+        # (1, H, W, C) -> NCHW -> bilinear downsample -> NHWC
+        t = cur.permute(0, 3, 1, 2)
+        t = F.interpolate(t, size=(nh, nw), mode="bilinear", align_corners=False)
+        t = t.permute(0, 2, 3, 1).contiguous()
+        mip_list.append(t)
+        cur = t
+        level += 1
+
+    return mip_list
+
+
 def render_texture(
     verts: torch.Tensor,
     faces: torch.Tensor,
@@ -93,18 +143,26 @@ def render_texture(
     img_h: int,
     img_w: int,
     enable_mip: bool = True,
+    max_mip_level: int = None,
+    mip_stack: list = None,
 ) -> tuple:
     """
-    可微分纹理渲染。
+    可微分纹理渲染，支持 mip mapping。
 
     Parameters
     ----------
-    verts   : (1, N, 3) 本地坐标
-    faces   : (M, 3) int32
-    uv      : (1, N, 2) 归一化 UV
-    texture : (1, H_tex, W_tex, 3) 纹理 atlas，值域 [0,1]
-    mvp     : (1, 4, 4) MVP 矩阵
-    img_h, img_w : 输出分辨率
+    verts         : (1, N, 3) 本地坐标
+    faces         : (M, 3) int32
+    uv            : (1, N, 2) 归一化 UV
+    texture       : (1, H_tex, W_tex, 3) 纹理 atlas，值域 [0,1]（尺寸须为 2 的幂）
+    mvp           : (1, 4, 4) MVP 矩阵
+    img_h, img_w  : 输出分辨率
+    enable_mip    : 是否启用 mip mapping（推荐 True 以减少 aliasing）
+    max_mip_level : 最大 mip 层级（0 = 仅用原始分辨率，4 = 最小 1/16 分辨率）
+                    None 表示不限制。建议设为 log2(atlas/output)+2 以防止过度模糊。
+    mip_stack     : 预构建的 mip pyramid（build_mip_stack() 的返回值）
+                    提供时跳过内部 auto-mip 构建；适合推理/无梯度渲染。
+                    优化阶段请传 None，让 nvdiffrast 自动构建以支持梯度反传。
 
     Returns
     -------
@@ -116,27 +174,32 @@ def render_texture(
     # 1. 变换到 clip-space
     clip = apply_mvp(verts, mvp)  # (1, N, 4)
 
-    # 2. 光栅化
+    # 2. 光栅化（rast_db 包含重心坐标屏幕空间微分，mip 计算必需）
     rast, rast_db = dr.rasterize(glctx, clip, faces, resolution=[img_h, img_w])
-    # rast: (1, H, W, 4)  [u_bary, v_bary, z/w, triangle_id]
 
-    # 3. 插值 UV 坐标到每个像素
-    # enable_mip=True 时需要 uv_da（UV 微分），用于 mipmap 过滤
+    # 3. 插值 UV 并计算 UV 屏幕空间微分 uv_da（用于 mip LOD 估计）
     if enable_mip:
         uv_interp, uv_da = dr.interpolate(uv, rast, faces, rast_db=rast_db, diff_attrs="all")
-        color = dr.texture(texture, uv_interp, uv_da=uv_da, filter_mode="linear-mipmap-linear")
+        # mip_stack 提供时使用显式 pyramid（推理加速），否则 auto-mip（支持梯度）
+        tex_src = mip_stack if mip_stack is not None else texture
+        color = dr.texture(
+            tex_src,
+            uv_interp,
+            uv_da=uv_da,
+            filter_mode="linear-mipmap-linear",
+            max_mip_level=max_mip_level,
+        )
     else:
         uv_interp, _ = dr.interpolate(uv, rast, faces)
         color = dr.texture(texture, uv_interp, filter_mode="linear")
-    # color: (1, H, W, 3)
 
-    # 5. 生成可见性 mask（triangle_id > 0 表示有三角形覆盖）
+    # 4. 生成可见性 mask（triangle_id > 0 表示有三角形覆盖）
     alpha = (rast[..., 3:4] > 0).float()  # (1, H, W, 1)
 
-    # 6. 抗锯齿（反向传播时平滑边界梯度）
+    # 5. 抗锯齿（反向传播时平滑边界梯度）
     color = dr.antialias(color, rast, clip, faces)
 
-    # 7. 垂直翻转：nvdiffrast 输出 row 0 = NDC y=-1 = 图像底部（OpenGL Y-up 规范），
+    # 6. 垂直翻转：nvdiffrast 输出 row 0 = NDC y=-1 = 图像底部（OpenGL Y-up 规范），
     #    翻转后 row 0 = 图像顶部，与标准图像坐标系一致（参见 nvdiffrast/samples/triangle.py）
     color = color.flip(dims=[1])
     alpha = alpha.flip(dims=[1])
