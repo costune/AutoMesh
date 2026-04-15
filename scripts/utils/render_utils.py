@@ -180,12 +180,22 @@ def render_texture(
     # 3. 插值 UV 并计算 UV 屏幕空间微分 uv_da（用于 mip LOD 估计）
     if enable_mip:
         uv_interp, uv_da = dr.interpolate(uv, rast, faces, rast_db=rast_db, diff_attrs="all")
-        # mip_stack 提供时使用显式 pyramid（推理加速），否则 auto-mip（支持梯度）
-        tex_src = mip_stack if mip_stack is not None else texture
+        # nvdiffrast API：
+        #   tex  = 基础层 Tensor (1, H, W, C)         ← 必须是 Tensor
+        #   mip  = 预构建的其余层列表 [level1, ...]    ← 可选；None = auto-mip
+        # 优化阶段传 mip_stack=None，让 nvdiffrast auto-mip 以支持梯度反传；
+        # 推理阶段传预构建的 mip_stack（build_mip_stack() 返回值）以加速。
+        if mip_stack is not None:
+            tex_base  = mip_stack[0]        # 基础层 Tensor
+            mip_extra = mip_stack[1:] if len(mip_stack) > 1 else None
+        else:
+            tex_base  = texture
+            mip_extra = None
         color = dr.texture(
-            tex_src,
+            tex_base,
             uv_interp,
             uv_da=uv_da,
+            mip=mip_extra,
             filter_mode="linear-mipmap-linear",
             max_mip_level=max_mip_level,
         )

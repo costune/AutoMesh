@@ -59,7 +59,6 @@ from utils.render_utils import (
     prepare_mesh_buffers,
     render_texture,
     render_normals,
-    build_mip_stack,
     texture_loss,
     create_texture,
     upsample_texture,
@@ -530,23 +529,14 @@ def run_iterative_refinement(
     迭代精炼循环（论文 §3.2）。
 
     每次迭代：
-      1. 预构建 mip stack（推理加速：避免每张图重复构建 mip chain）
-      2. 从当前纹理渲染新视角图像 I_low
-      3. 经恢复网络得到伪真值 I_target = D(I_low)
-      4. 以 I_target 为监督优化纹理（20 epochs）
-      5. 优化结束后 mip stack 已过期，下轮开头重建
+      1. 从当前纹理渲染新视角图像 I_low（auto-mip，nvdiffrast 自动构建 pyramid）
+      2. 经恢复网络得到伪真值 I_target = D(I_low)
+      3. 以 I_target 为监督优化纹理（n_epochs 轮）
     """
     print(f"\n[精炼] 开始迭代精炼: {n_iters} 轮 × {n_epochs} epochs")
 
     for it in range(n_iters):
         print(f"\n[精炼] === 迭代 {it+1}/{n_iters} ===")
-
-        # 预构建 mip stack（纹理在本次 novel view 渲染阶段保持不变，可安全复用）
-        with torch.no_grad():
-            mip_stack = build_mip_stack(texture.data, max_levels=max_mip_level)
-        print(f"  [mip] 已构建 mip pyramid: {len(mip_stack)} 层 "
-              f"({mip_stack[0].shape[1]}×{mip_stack[0].shape[2]} → "
-              f"{mip_stack[-1].shape[1]}×{mip_stack[-1].shape[2]})")
 
         # 为每个新视角相机渲染并生成伪真值
         refined_cameras = []
@@ -564,7 +554,6 @@ def run_iterative_refinement(
                 I_low, alpha = render_texture(
                     verts_t, faces_t, uv_t, texture, mvp, img_h, img_w,
                     max_mip_level=max_mip_level,
-                    mip_stack=mip_stack,
                 )
 
             if alpha.sum() < 100:
