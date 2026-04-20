@@ -32,9 +32,9 @@ DEFAULT_SRC_PROMPT = (
 )
 
 DEFAULT_TAR_PROMPT = (
-    "Clear satellite image of an urban area with sharp buildings, smooth edges, "
-    "and no distortions. Roads, green spaces, and the white angular structure "
-    "are crisp, with natural lighting and well-defined textures."
+    "Clear satellite image of an urban area with sharp buildings, smooth edges and no distortions. "
+    "Roads, green spaces, and the white angular structure are crisp, with natural lighting, well-defined textures and smooth color transition. "
+    "The windows on the side facade of the building have distinct and regular shapes."
 )
 
 

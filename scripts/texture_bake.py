@@ -641,7 +641,7 @@ def parse_args():
                    help="几何优化 Laplacian 平滑权重（default=0.1）")
     p.add_argument("--lambda_reg",    type=float, default=0.01,
                    help="几何优化 delta_z L2 正则化权重（default=0.01）")
-    p.add_argument("--refine_iters",type=int, default=3,    help="精炼迭代次数")
+    p.add_argument("--refine_iters",type=int, default=5,    help="精炼迭代次数")
     p.add_argument("--refine_epochs",type=int, default=100,  help="每轮精炼优化步数")
     p.add_argument("--max_novel_cams",type=int,default=96,  help="最大新视角相机数")
     # UAV 新视角相机参数
@@ -694,7 +694,7 @@ def parse_args():
                    help="源方向引导强度（默认 1.5；控制退化特征的抑制力度）")
     p.add_argument("--flux_tar_guidance",type=float, default=5.5,
                    help="目标方向引导强度（默认 5.5；越高越清晰但越可能改变内容）")
-    p.add_argument("--flux_n_min",       type=int,   default=0,
+    p.add_argument("--flux_n_min",       type=int,   default=2,
                    help="末尾切换为标准采样的步数（默认 0=全程 ODE，结构保留最好）")
     p.add_argument("--flux_n_max",       type=int,   default=15,
                    help="开始编辑的步数（默认 15，即跳过前 T_steps-15 步热身）")
