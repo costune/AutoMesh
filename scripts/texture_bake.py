@@ -628,6 +628,9 @@ def parse_args():
                    help="体素化 Z 方向层数（越大墙面越精细，默认 128）")
     p.add_argument("--simplify_faces", type=int, default=0,
                    help="quadric 简化目标面数（0 = 不简化；推荐约为 marching cubes 面数的 20%）")
+    p.add_argument("--uv_method", default="tutte", choices=["tutte", "xatlas"],
+                   help="UV 展开方法：tutte（默认，严格单 island，无顶点复制）或 "
+                        "xatlas（自动多 island，缝合线处复制顶点，展开更均匀）")
     p.add_argument("--atlas_size",  type=int, default=2048, help="纹理 atlas 最终分辨率")
     p.add_argument("--init_atlas_size", type=int, default=512,
                    help="渐进分辨率起始尺寸（2 的幂，如 512）；None 表示直接用 atlas_size")
@@ -770,6 +773,7 @@ def main():
         voxel_z_res=args.voxel_z_res,
         simplify_faces=args.simplify_faces,
         aligned_vertices=aligned_verts,
+        uv_method=args.uv_method,
     )
 
     # 始终保存 marching cubes 原始 Mesh（简化/UV 之前）

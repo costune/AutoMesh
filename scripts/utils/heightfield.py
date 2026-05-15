@@ -375,6 +375,72 @@ def single_island_uv(
 
 
 # ---------------------------------------------------------------------------
+# xatlas UV 展开（多 island，缝合线处复制顶点）
+# ---------------------------------------------------------------------------
+
+def xatlas_uv(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    chart_options: dict = None,
+    pack_options: dict = None,
+) -> tuple:
+    """
+    使用 xatlas 对 Mesh 进行 UV 展开（自动分割 chart、打包 island）。
+
+    xatlas 在缝合线处会复制顶点（法线跳变处自动插缝），因此返回的顶点数
+    可能大于输入顶点数。返回重新索引后的完整数组，可直接替换原始 vertices/faces/uv。
+
+    Parameters
+    ----------
+    vertices      : (N, 3) float32，世界坐标
+    faces         : (M, 3) int32
+    chart_options : xatlas.ChartOptions 参数字典，如 {"max_iterations": 1}
+    pack_options  : xatlas.PackOptions 参数字典，如 {"padding": 2, "resolution": 4096}
+
+    Returns
+    -------
+    new_vertices : (N', 3) float32，缝合复制后的顶点（N' >= N）
+    new_faces    : (M, 3) int32，重新索引后的面片（面数不变）
+    uv           : (N', 2) float32，归一化 [0, 1]，多 island
+    """
+    try:
+        import xatlas
+    except ImportError as e:
+        raise ImportError(
+            "xatlas 未安装，请执行: pip install xatlas>=0.0.8"
+        ) from e
+
+    import xatlas
+
+    atlas = xatlas.Atlas()
+    atlas.add_mesh(vertices, faces)
+
+    c_opts = xatlas.ChartOptions()
+    if chart_options:
+        for k, v in chart_options.items():
+            setattr(c_opts, k, v)
+
+    p_opts = xatlas.PackOptions()
+    if pack_options:
+        for k, v in pack_options.items():
+            setattr(p_opts, k, v)
+
+    atlas.generate(c_opts, p_opts)
+
+    # xatlas 返回每个 mesh 的 (vmapping, indices, uvs)
+    vmapping, new_faces, uvs = atlas[0]
+    # vmapping: (N',) int，new_vertices[i] = vertices[vmapping[i]]
+    new_vertices = vertices[vmapping]
+    uv = uvs.astype(np.float32)  # 已归一化 [0, 1]
+
+    n_charts = atlas.mesh_count
+    print(f"[heightfield] xatlas UV 展开完成: {len(new_vertices)} 顶点（+{len(new_vertices)-len(vertices)} 缝合复制）, "
+          f"{len(new_faces)} 面")
+
+    return new_vertices.astype(np.float32), new_faces.astype(np.int32), uv
+
+
+# ---------------------------------------------------------------------------
 # 保留原 grid_to_mesh（仅供外部调试使用，主管线不再调用）
 # ---------------------------------------------------------------------------
 
@@ -424,10 +490,11 @@ def build_heightfield_mesh(
     voxel_z_res: int = 128,
     simplify_faces: int = 0,
     aligned_vertices: np.ndarray = None,
+    uv_method: str = "tutte",
 ) -> dict:
     """
     完整管线：加载 NeuS Mesh → 射线采样高度场 → 体素化 → marching cubes
-    → （可选）quadric 简化 → Tutte 调和映射单 Island UV
+    → （可选）quadric 简化 → UV 展开
 
     Parameters
     ----------
@@ -437,13 +504,15 @@ def build_heightfield_mesh(
     voxel_z_res       : 体素 Z 方向层数，越大墙面越精细
     simplify_faces    : 目标面数，0 = 不简化
     aligned_vertices  : (V, 3) float32，若提供则替换 PLY 中的顶点（对齐后）
+    uv_method         : UV 展开方法，"tutte"（默认，严格单 island，无顶点复制）
+                        或 "xatlas"（自动多 island，缝合线处复制顶点，更均匀但有缝）
 
     Returns
     -------
     dict 包含：
         vertices  : (N, 3) float32，世界坐标（米）
         faces     : (M, 3) int32
-        uv        : (N, 2) float32，归一化 [0,1]，严格单 island
+        uv        : (N, 2) float32，归一化 [0,1]
         x_min/max, y_min/max, z_min/max : 场景范围（米）
         z_grid    : (H, W) float32，高度场（调试用）
         info      : mesh_info 字典
@@ -526,9 +595,15 @@ def build_heightfield_mesh(
         print(f"[heightfield] quadric 网格简化 → 目标面数: {simplify_faces} ...")
         vertices, faces = simplify_mesh(vertices, faces, simplify_faces)
 
-    print("[heightfield] Tutte 调和映射 → 单 Island UV ...")
-    uv = single_island_uv(vertices, faces)
-    print(f"[heightfield] UV 展开完成: {len(vertices)} 顶点（无缝合复制）")
+    if uv_method == "xatlas":
+        print("[heightfield] xatlas UV 展开（多 island，缝合线处复制顶点）...")
+        vertices, faces, uv = xatlas_uv(vertices, faces)
+    else:
+        if uv_method != "tutte":
+            print(f"[heightfield] 未知 uv_method='{uv_method}'，回退到 tutte")
+        print("[heightfield] Tutte 调和映射 → 单 Island UV ...")
+        uv = single_island_uv(vertices, faces)
+        print(f"[heightfield] UV 展开完成: {len(vertices)} 顶点（无缝合复制）")
 
     return {
         "vertices": vertices,
